@@ -149,7 +149,13 @@ class EagerRunner(BaseRunner):
             if dllm_config is not None:
                 # dLLM runs block_size tokens/request (DLLM_EXTEND).
                 num_tokens_per_req = dllm_config.block_size
-        max_bs = mr.max_running_requests
+        # The eager registry's bs-axis buffers are canonical: the cuda-graph
+        # runners' same-named slots adopt them through the shared pool. Size
+        # them to the req pool (>= max_running_requests, which for the draft
+        # worker is clamped down by the mamba-ratio formula) or a draft graph
+        # capture at bs > max_running_requests crashes with a
+        # (max_running_requests,)-vs-(bs,) copy mismatch.
+        max_bs = max(mr.max_running_requests, mr.req_to_token_pool.size)
         if (
             mr.is_draft_worker
             and mr.spec_algorithm.is_frozen_kv_mtp()

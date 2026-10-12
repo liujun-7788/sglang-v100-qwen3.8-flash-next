@@ -241,6 +241,11 @@ class _InitializedPools(msgspec.Struct, frozen=True, kw_only=True):
     unified_memory_pool: Optional[UnifiedKVPool] = None
 
 
+# Spare req_to_token rows so chunked-prefill requests can overlap with
+# decode without the admission loop tripping the row ceiling.
+EXTRA_POOL_ROWS = 4
+
+
 class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     max_total_num_tokens: int
     max_running_requests: int
@@ -1012,8 +1017,15 @@ class KVCacheConfigurator:
             )
 
         if self.mambaish_config:
+            # Headroom for chunked-prefill overlap. The pool was sized exactly
+            # max_running_requests, so with two in-flight chunked requests the
+            # admission loop's allocatable count (req-pool rows minus running)
+            # dropped to 2 and the third long request queued ~130 s; its prefill
+            # then overlapped the others' decode and starved it for ~1 min
+            # stretches (3x131k collapsed from ~107 to 6 tok/s aggregate).
+            # A few spare rows (~1 MB each) remove the false ceiling.
             return self._build_hybrid_req_pool(
-                max_num_reqs=max_num_reqs,
+                max_num_reqs=max_num_reqs + EXTRA_POOL_ROWS,
                 extra_max_context_len=extra_max_context_len,
             )
         return self._build_default_req_pool(
