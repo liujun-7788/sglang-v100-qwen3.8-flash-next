@@ -18,6 +18,7 @@
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <cstdlib>
 
 namespace sm70_longctx {
 
@@ -65,6 +66,33 @@ __device__ __forceinline__ void e5m2_to_fp16_16(const uint4 raw, half* dst) {
   *reinterpret_cast<uint4*>(dst + 8) = *reinterpret_cast<const uint4*>(out + 4);
 }
 
+// E4M3 shares no exponent layout with FP16 (4-bit exponent, bias 7, three
+// mantissa bits), so the byte-shift trick above is invalid for it. Widen each
+// byte through a 256-entry FP16 lookup that the host precomputes once; the
+// table is 512 bytes and stays in cache. Same 16-values-per-thread layout.
+__device__ __forceinline__ void e4m3_lut_to_fp16_16(
+    const uint4 raw, half* dst, const __half* __restrict__ lut) {
+  const uint8_t* r = reinterpret_cast<const uint8_t*>(&raw);
+  __half out[16];
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    out[i] = lut[r[i]];
+  }
+  *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(out);
+  *reinterpret_cast<uint4*>(dst + 8) = *reinterpret_cast<const uint4*>(out + 8);
+}
+
+// Byte-cache conversion selected by the LUT pointer: E4M3 when provided,
+// E5M2 (byte shift) otherwise. FP16 caches never reach this helper.
+__device__ __forceinline__ void kv8_to_fp16_16(
+    const uint4 raw, half* dst, const __half* __restrict__ lut) {
+  if (lut != nullptr) {
+    e4m3_lut_to_fp16_16(raw, dst, lut);
+  } else {
+    e5m2_to_fp16_16(raw, dst);
+  }
+}
+
 // Load one K/V token tile into shared memory. The cache element type selects
 // the read path: the E5M2 byte cache is read as one 16-byte vector per thread
 // and dequantized to FP16; an FP16 cache is read as two 16-byte vectors per
@@ -75,6 +103,7 @@ __device__ __forceinline__ void load_kv_tile(const KV* __restrict__ k_cache,
                                              const KV* __restrict__ v_cache,
                                              const int* __restrict__ slots,
                                              const int tile_tokens, const int tid,
+                                             const __half* __restrict__ lut,
                                              __half* __restrict__ ks,
                                              __half* __restrict__ vs) {
   constexpr int kLoadIters = (kBlockN * (kDim / 16) + kThreads - 1) / kThreads;
@@ -91,11 +120,12 @@ __device__ __forceinline__ void load_kv_tile(const KV* __restrict__ k_cache,
     if (tok_local < tile_tokens && slot >= 0) {
       const int64_t base = (int64_t)slot * kDim + d_off;
       if constexpr (sizeof(KV) == 1) {
-        // E5M2 byte cache: base is in bytes, one 16-byte vector per thread.
-        e5m2_to_fp16_16(*reinterpret_cast<const uint4*>(k_cache + base),
-                        ks + dst);
-        e5m2_to_fp16_16(*reinterpret_cast<const uint4*>(v_cache + base),
-                        vs + dst);
+        // Byte cache (E5M2 or E4M3): base is in bytes, one 16-byte vector
+        // per thread; the LUT pointer selects the conversion.
+        kv8_to_fp16_16(*reinterpret_cast<const uint4*>(k_cache + base),
+                       ks + dst, lut);
+        kv8_to_fp16_16(*reinterpret_cast<const uint4*>(v_cache + base),
+                       vs + dst, lut);
       } else {
         // FP16 cache: base is in halves, two 16-byte vectors per thread.
         const uint4* sk = reinterpret_cast<const uint4*>(k_cache + base);
@@ -353,7 +383,8 @@ qsa_decode_partial_kernel(
     const int* __restrict__ req_indices, const int* __restrict__ indices,
     const int* __restrict__ seq_lens, const int req_stride, const int topk,
     const int max_splits, const int min_tokens_per_split,
-    const float score_scale, __half* __restrict__ partial_o,
+    const float score_scale, const __half* __restrict__ lut,
+    __half* __restrict__ partial_o,
     float* __restrict__ partial_lse) {
   const int split_id = blockIdx.y;
   const int seq_id = blockIdx.z;
@@ -421,7 +452,7 @@ qsa_decode_partial_kernel(
     }
     __syncthreads();
 
-    load_kv_tile<KV>(k_cache, v_cache, slots, tile_tokens, tid, ks, vs);
+    load_kv_tile<KV>(k_cache, v_cache, slots, tile_tokens, tid, lut, ks, vs);
     __syncthreads();
 
     if (is_compute_warp) {
@@ -616,7 +647,8 @@ qsa_prefill_kernel(const __half* __restrict__ q,
                    const int* __restrict__ indices,
                    const int* __restrict__ seq_lens, const int req_stride,
                    const int topk,
-                   const float score_scale, __half* __restrict__ output) {
+                   const float score_scale, const __half* __restrict__ lut,
+                   __half* __restrict__ output) {
   const int query = blockIdx.x;
   const int req_index = req_indices[0];
   const int seq_len = seq_lens[0];
@@ -692,8 +724,8 @@ qsa_prefill_kernel(const __half* __restrict__ q,
         raw_v = *reinterpret_cast<const uint4*>(v_cache + base);
       }
       const int dst = tok_local * kKVStride + d_off;
-      e5m2_to_fp16_16(raw_k, ks + dst);
-      e5m2_to_fp16_16(raw_v, vs + dst);
+      kv8_to_fp16_16(raw_k, ks + dst, lut);
+      kv8_to_fp16_16(raw_v, vs + dst, lut);
     }
     __syncthreads();
 
@@ -795,6 +827,311 @@ qsa_prefill_kernel(const __half* __restrict__ q,
   }
 }
 
+// ---- Tensor-core variant of the chunk-prefill (SGLANG_SM70_QSA_MMA=1) ----
+// Same load phase and online softmax as qsa_prefill_kernel; the score and
+// p·V products run on mma.sync.m8n8k4 (Volta: four independent 8x8x4 products
+// per warp, one per quad-pair). Fragment layout (matches turbomind's
+// SM70_MMA_884): thread jj = (lane&3) + 4*(lane>>4) of quad-pair
+// qp = (lane>>2)&3 holds A row jj k0..3 / B col jj k0..3; C register i is
+// row (lane&1)+4*(lane>>4)+2*((i>>1)&1), column (lane&2)+4*(i>>2)+(i&1).
+// QK: warps 0..3 each own 64 dims (16 k-steps of 4); QP q covers cells
+// 8q..8q+7; two 8-row blocks cover the 16 padded head rows (6 real). The
+// query is already FP16 so no hi/lo split is needed. PV: warp w owns dims
+// [64w, 64w+64); QP q covers 16 dims as two n-tiles of 8; k walks the 32
+// cells in steps of 4. Padded rows load zero probabilities, so their
+// accumulators stay zero and are skipped at the write-out.
+__device__ __forceinline__ void mma884(float* c, uint32_t a0, uint32_t a1,
+                                       uint32_t b0, uint32_t b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 750
+  asm volatile(
+      "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+      "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+      "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]),
+        "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+      : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+#else
+  __trap();  // m8n8k4 is a Volta instruction; host only launches on sm_70
+#endif
+}
+
+constexpr int kQRows = 16;                      // 6 heads padded to 16
+constexpr int kPartStride = kBlockN + 2;        // float partials (34)
+constexpr int kProbStride = kBlockN + 4;        // halves, 8B-aligned rows (72B)
+
+__global__ void __launch_bounds__(kThreads, 1)
+qsa_prefill_kernel_mma(const __half* __restrict__ q,
+                       const uint8_t* __restrict__ k_cache,
+                       const uint8_t* __restrict__ v_cache,
+                       const int* __restrict__ req_to_token,
+                       const int* __restrict__ req_indices,
+                       const int* __restrict__ indices,
+                       const int* __restrict__ seq_lens, const int req_stride,
+                       const int topk, const float score_scale,
+                       const __half* __restrict__ lut,
+                       __half* __restrict__ output) {
+  const int query = blockIdx.x;
+  const int req_index = req_indices[0];
+  const int seq_len = seq_lens[0];
+  const int visible = min(seq_len, query + seq_len - gridDim.x + 1);
+  const int row_topk = min(topk, max(0, visible));
+
+  __shared__ __half ks[kSmemKV];
+  __shared__ __half vs[kSmemKV];
+  __shared__ __half qh[kGroup * kDim];
+  __shared__ float part[4][kQRows][kPartStride];
+  __shared__ __half probs16[kQRows * kProbStride];  // rows 6..15 stay zero
+  __shared__ int slots[kBlockN];
+  __shared__ float alpha16[kQRows];
+  __shared__ float lsum16[kQRows];
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const bool is_compute_warp = warp < kGroup;
+  const float scale_log2 = score_scale * kLog2E;
+  const int qp = (lane >> 2) & 3;
+  const int jj = (lane & 3) + 4 * (lane >> 4);
+  const int crow = (lane & 1) + 4 * (lane >> 4);
+  const int ccol = lane & 2;
+
+  for (int i = tid; i < kGroup * kDim; i += kThreads) {
+    qh[i] = q[(int64_t)query * kGroup * kDim + i];
+  }
+  // Padded head rows (6..15) keep zero probabilities for the whole kernel:
+  // the PV A-fragments of those rows read zeros, so their accumulators stay
+  // zero and the write-out skips them. Rows 0..5 are rewritten per tile.
+  for (int i = tid; i < kQRows * kProbStride; i += kThreads) {
+    probs16[i] = __float2half(0.f);
+  }
+  if (tid < kQRows) {
+    alpha16[tid] = 0.f;
+    lsum16[tid] = 0.f;
+  }
+
+  float m_row[kGroup];
+  float l_row[kGroup];
+#pragma unroll
+  for (int r = 0; r < kGroup; ++r) {
+    m_row[r] = -1.0e30f;
+    l_row[r] = 0.f;
+  }
+  float acc[2][2][8];  // [row block][n tile][C registers]
+#pragma unroll
+  for (int rb = 0; rb < 2; ++rb)
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        acc[rb][nt][i] = 0.f;
+      }
+  __syncthreads();
+
+  const int num_tiles = (row_topk + kBlockN - 1) / kBlockN;
+  constexpr int kLoadIters = (kBlockN * (kDim / 16) + kThreads - 1) / kThreads;
+  for (int tile = 0; tile < num_tiles; ++tile) {
+    const int tile_begin = tile * kBlockN;
+    const int tile_tokens = min(kBlockN, row_topk - tile_begin);
+    if (tid < kBlockN) {
+      const int selected = tile_begin + tid;
+      int slot = -1;
+      if (selected < row_topk) {
+        const int logical = indices[(int64_t)query * topk + selected];
+        if (logical >= 0 && logical < visible) {
+          slot = req_to_token[(int64_t)req_index * req_stride + logical];
+        }
+      }
+      slots[tid] = slot;
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int it = 0; it < kLoadIters; ++it) {
+      const int vector = tid + it * kThreads;
+      const int byte_off = vector << 4;
+      const int tok_local = byte_off >> 8;
+      const int d_off = byte_off & 255;
+      const int slot = slots[tok_local];
+      uint4 raw_k = make_uint4(0, 0, 0, 0);
+      uint4 raw_v = make_uint4(0, 0, 0, 0);
+      if (tok_local < tile_tokens && slot >= 0) {
+        const int64_t base = (int64_t)slot * kDim + d_off;
+        raw_k = *reinterpret_cast<const uint4*>(k_cache + base);
+        raw_v = *reinterpret_cast<const uint4*>(v_cache + base);
+      }
+      const int dst = tok_local * kKVStride + d_off;
+      kv8_to_fp16_16(raw_k, ks + dst, lut);
+      kv8_to_fp16_16(raw_v, vs + dst, lut);
+    }
+    __syncthreads();
+
+    // ---- QK on tensor cores: warp w owns dims [64w, 64w+64) ----
+    if (warp < 4) {
+      float tg[2][8];
+#pragma unroll
+      for (int rb = 0; rb < 2; ++rb)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          tg[rb][i] = 0.f;
+        }
+      const int cell_b = qp * 8 + jj;
+#pragma unroll
+      for (int kstep = 0; kstep < kDim / 4 / 4; ++kstep) {  // 16 k-steps
+        const int d0 = warp * 64 + kstep * 4;
+        const uint32_t b0 = *reinterpret_cast<const uint32_t*>(
+            ks + cell_b * kKVStride + d0);
+        const uint32_t b1 = *reinterpret_cast<const uint32_t*>(
+            ks + cell_b * kKVStride + d0 + 2);
+#pragma unroll
+        for (int rb = 0; rb < 2; ++rb) {
+          // Rows 6..15 are zero padding: the query smem only holds the six
+          // real heads, so out-of-range rows contribute exact zeros.
+          uint2 ah = make_uint2(0u, 0u);
+          if (rb * 8 + jj < kGroup) {
+            ah = *reinterpret_cast<const uint2*>(
+                &qh[(rb * 8 + jj) * kDim + d0]);
+          }
+          mma884(tg[rb], ah.x, ah.y, b0, b1);
+        }
+      }
+#pragma unroll
+      for (int rb = 0; rb < 2; ++rb)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          const int row = rb * 8 + crow + 2 * ((i >> 1) & 1);
+          const int cell = qp * 8 + ccol + 4 * (i >> 2) + (i & 1);
+          part[warp][row][cell] = tg[rb][i];
+        }
+    }
+    __syncthreads();
+
+    // ---- Online softmax: unchanged, but the score sums the four 64-dim
+    // partials from the tensor-core warps. ----
+    if (is_compute_warp) {
+      const int r = warp;
+      const int n = lane;
+      // The four 64-dim tensor-core partials for this (row, cell) sum in a
+      // fixed order; invalid cells go to -inf so softmax masks them.
+      const float sc =
+          (n < tile_tokens && slots[n] >= 0)
+              ? ((part[0][r][n] + part[1][r][n]) +
+                 (part[2][r][n] + part[3][r][n]))
+              : -1.0e30f;
+      __syncwarp();
+
+      float loc_max = sc;
+#pragma unroll
+      for (int off = 16; off; off >>= 1) {
+        loc_max = fmaxf(loc_max, __shfl_xor_sync(0xffffffffu, loc_max, off));
+      }
+      const float m_new = fmaxf(m_row[r], loc_max);
+      const float alpha = exp2f((m_row[r] - m_new) * scale_log2);
+      m_row[r] = m_new;
+      l_row[r] *= alpha;
+      if (lane == 0) {
+        alpha16[r] = alpha;
+        lsum16[r] = l_row[r];
+      }
+      float p = 0.f;
+      if (lane < tile_tokens && slots[lane] >= 0) {
+        p = exp2f((sc - m_new) * scale_log2);
+      }
+      probs16[r * kProbStride + lane] = __float2half(p);
+      float loc_sum = p;
+#pragma unroll
+      for (int off = 16; off; off >>= 1) {
+        loc_sum += __shfl_xor_sync(0xffffffffu, loc_sum, off);
+      }
+      l_row[r] += loc_sum;
+      if (lane == 0) {
+        lsum16[r] = l_row[r];
+      }
+    }
+    __syncthreads();
+
+    // ---- p·V on tensor cores: warp w owns dims [64w, 64w+64) ----
+    if (warp < 4) {
+      float tmp[2][2][8];
+#pragma unroll
+      for (int rb = 0; rb < 2; ++rb)
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            tmp[rb][nt][i] = 0.f;
+          }
+#pragma unroll
+      for (int kstep = 0; kstep < kBlockN / 4; ++kstep) {  // 8 k-steps
+        const int c0 = kstep * 4;
+        uint2 ah[2];
+#pragma unroll
+        for (int rb = 0; rb < 2; ++rb) {
+          // A row jj of this 8-row block: P[row][c0..c0+3]; rows 6..15 are
+          // the zero-initialized padding of probs16.
+          ah[rb] = *reinterpret_cast<const uint2*>(
+              &probs16[(rb * 8 + jj) * kProbStride + c0]);
+        }
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+          const int d = warp * 64 + qp * 16 + nt * 8 + jj;
+          const __half2 h0 = __halves2half2(
+              *reinterpret_cast<const __half*>(&vs[c0 * kKVStride + d]),
+              *reinterpret_cast<const __half*>(&vs[(c0 + 1) * kKVStride + d]));
+          const __half2 h1 = __halves2half2(
+              *reinterpret_cast<const __half*>(&vs[(c0 + 2) * kKVStride + d]),
+              *reinterpret_cast<const __half*>(&vs[(c0 + 3) * kKVStride + d]));
+          const uint32_t bb0 = *reinterpret_cast<const uint32_t*>(&h0);
+          const uint32_t bb1 = *reinterpret_cast<const uint32_t*>(&h1);
+#pragma unroll
+          for (int rb = 0; rb < 2; ++rb) {
+            mma884(tmp[rb][nt], ah[rb].x, ah[rb].y, bb0, bb1);
+          }
+        }
+      }
+      // Rescale by this tile's alpha per output row, then accumulate.
+#pragma unroll
+      for (int rb = 0; rb < 2; ++rb) {
+        const float a0 = alpha16[rb * 8 + crow];
+        const float a2 = alpha16[rb * 8 + crow + 2];
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            acc[rb][nt][i] =
+                fmaf(acc[rb][nt][i], ((i >> 1) & 1) ? a2 : a0, tmp[rb][nt][i]);
+          }
+      }
+    }
+    __syncthreads();
+  }
+
+  // ---- Write-out: warp w owns dims [64w, 64w+64) of the six real rows ----
+  if (warp < 4) {
+#pragma unroll
+    for (int rb = 0; rb < 2; ++rb)
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int row = rb * 8 + crow + 2 * h;
+        if (row >= kGroup) {
+          continue;
+        }
+        const float inv_l = lsum16[row] > 0.f ? 1.f / lsum16[row] : 0.f;
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+          for (int hh = 0; hh < 2; ++hh) {
+            const int i = hh * 4 + h * 2;
+            const int d =
+                warp * 64 + qp * 16 + nt * 8 + ccol + 4 * hh;
+            output[(int64_t)query * kGroup * kDim + row * kDim + d] =
+                __float2half_rn(acc[rb][nt][i] * inv_l);
+            output[(int64_t)query * kGroup * kDim + row * kDim + d + 1] =
+                __float2half_rn(acc[rb][nt][i + 1] * inv_l);
+          }
+      }
+  }
+}
+
 }  // namespace sm70_longctx
 
 void sm70_longctx_decode(torch::Tensor q, torch::Tensor k_cache,
@@ -838,6 +1175,7 @@ void sm70_qsa_decode(torch::Tensor q, torch::Tensor k_cache,
                      torch::Tensor req_indices, torch::Tensor indices,
                      torch::Tensor seq_lens, int64_t max_splits,
                      int64_t min_tokens_per_split, double softmax_scale,
+                     c10::optional<torch::Tensor> lut,
                      torch::Tensor partial_o, torch::Tensor partial_lse) {
   using namespace sm70_longctx;
   c10::cuda::CUDAGuard guard(q.device());
@@ -874,6 +1212,12 @@ void sm70_qsa_decode(torch::Tensor q, torch::Tensor k_cache,
                   partial_lse.size(1) == max_splits &&
                   partial_lse.size(2) == kGroup,
               "sm70_qsa_decode partial LSE has the wrong shape");
+  const __half* lut_ptr = nullptr;
+  if (lut.has_value() && lut->defined()) {
+    TORCH_CHECK(lut->scalar_type() == torch::kHalf && lut->numel() == 256,
+                "sm70_qsa_decode lut must be 256 fp16 entries");
+    lut_ptr = reinterpret_cast<const __half*>(lut->data_ptr());
+  }
   auto stream = at::cuda::getCurrentCUDAStream();
   const dim3 grid(1, (unsigned int)max_splits, (unsigned int)q.size(0));
   if (is_e5m2) {
@@ -883,7 +1227,7 @@ void sm70_qsa_decode(torch::Tensor q, torch::Tensor k_cache,
         req_to_token.data_ptr<int>(), req_indices.data_ptr<int>(),
         indices.data_ptr<int>(), seq_lens.data_ptr<int>(),
         (int)req_to_token.size(1), (int)indices.size(1), (int)max_splits,
-        (int)min_tokens_per_split, (float)softmax_scale,
+        (int)min_tokens_per_split, (float)softmax_scale, lut_ptr,
         reinterpret_cast<__half*>(partial_o.data_ptr()),
         partial_lse.data_ptr<float>());
   } else {
@@ -894,7 +1238,7 @@ void sm70_qsa_decode(torch::Tensor q, torch::Tensor k_cache,
         req_to_token.data_ptr<int>(), req_indices.data_ptr<int>(),
         indices.data_ptr<int>(), seq_lens.data_ptr<int>(),
         (int)req_to_token.size(1), (int)indices.size(1), (int)max_splits,
-        (int)min_tokens_per_split, (float)softmax_scale,
+        (int)min_tokens_per_split, (float)softmax_scale, lut_ptr,
         reinterpret_cast<__half*>(partial_o.data_ptr()),
         partial_lse.data_ptr<float>());
   }
@@ -944,6 +1288,7 @@ void sm70_qsa_prefill(torch::Tensor q, torch::Tensor k_cache,
                       torch::Tensor v_cache, torch::Tensor req_to_token,
                       torch::Tensor req_indices, torch::Tensor indices,
                       torch::Tensor seq_lens, double softmax_scale,
+                      c10::optional<torch::Tensor> lut,
                       torch::Tensor output) {
   using namespace sm70_longctx;
   c10::cuda::CUDAGuard guard(q.device());
@@ -967,14 +1312,36 @@ void sm70_qsa_prefill(torch::Tensor q, torch::Tensor k_cache,
   TORCH_CHECK(output.scalar_type() == torch::kHalf &&
                   output.sizes() == q.sizes(),
               "sm70_qsa_prefill output must match Q");
+  const __half* lut_ptr = nullptr;
+  if (lut.has_value() && lut->defined()) {
+    TORCH_CHECK(lut->scalar_type() == torch::kHalf && lut->numel() == 256,
+                "sm70_qsa_prefill lut must be 256 fp16 entries");
+    lut_ptr = reinterpret_cast<const __half*>(lut->data_ptr());
+  }
   auto stream = at::cuda::getCurrentCUDAStream();
-  qsa_prefill_kernel<<<q.size(0), kThreads, 0, stream>>>(
-      reinterpret_cast<const __half*>(q.data_ptr()),
-      k_cache.data_ptr<uint8_t>(), v_cache.data_ptr<uint8_t>(),
-      req_to_token.data_ptr<int>(), req_indices.data_ptr<int>(),
-      indices.data_ptr<int>(), seq_lens.data_ptr<int>(),
-      (int)req_to_token.size(1), (int)indices.size(1),
-      (float)softmax_scale, reinterpret_cast<__half*>(output.data_ptr()));
+  static const bool use_mma = [] {
+    const char* env = std::getenv("SGLANG_SM70_QSA_MMA");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+  }();
+  if (use_mma) {
+    qsa_prefill_kernel_mma<<<q.size(0), kThreads, 0, stream>>>(
+        reinterpret_cast<const __half*>(q.data_ptr()),
+        k_cache.data_ptr<uint8_t>(), v_cache.data_ptr<uint8_t>(),
+        req_to_token.data_ptr<int>(), req_indices.data_ptr<int>(),
+        indices.data_ptr<int>(), seq_lens.data_ptr<int>(),
+        (int)req_to_token.size(1), (int)indices.size(1),
+        (float)softmax_scale, lut_ptr,
+        reinterpret_cast<__half*>(output.data_ptr()));
+  } else {
+    qsa_prefill_kernel<<<q.size(0), kThreads, 0, stream>>>(
+        reinterpret_cast<const __half*>(q.data_ptr()),
+        k_cache.data_ptr<uint8_t>(), v_cache.data_ptr<uint8_t>(),
+        req_to_token.data_ptr<int>(), req_indices.data_ptr<int>(),
+        indices.data_ptr<int>(), seq_lens.data_ptr<int>(),
+        (int)req_to_token.size(1), (int)indices.size(1),
+        (float)softmax_scale, lut_ptr,
+        reinterpret_cast<__half*>(output.data_ptr()));
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
