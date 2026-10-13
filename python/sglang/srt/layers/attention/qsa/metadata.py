@@ -89,6 +89,13 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     compress_group_ring_locs: Optional[torch.Tensor] = None
     extend_rope_matrix: Optional[torch.Tensor] = None
     graph_ring_group_locs: Optional[torch.Tensor] = None
+    # CPU-side sequence lengths for extend forwards, sourced from
+    # seq_lens_cpu at construction: lets get_prefill_mqa_inputs build the
+    # compressed-slot addressing without a GPU .tolist() sync every layer.
+    sequence_lengths_list: Optional[list] = None
+    # Compressed-slot addresses for this forward (identical across layers;
+    # only the per-layer buffer varies). Filled once on first prefill call.
+    prefill_loc_cache: object = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.sequence_lengths.to(torch.int32)
@@ -135,31 +142,41 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
         pool = self.token_to_kv_pool
         ratio = self.compress_ratio
         compressed_buffer = pool.get_qsa_compressed_k_buffer(layer_id)
-        parts = []
         sequence_lengths = self.sequence_lengths.to(torch.int32)
-        sequence_lengths_list = sequence_lengths.tolist()
-        for sequence_id in range(len(sequence_lengths_list)):
-            complete_blocks = int(sequence_lengths_list[sequence_id]) // ratio
-            if complete_blocks == 0:
-                continue
-            # DSV4-style addressing: a group's compressed slot is its first
-            # raw slot // ratio (the page-aligned allocator keeps the group
-            # contiguous in one page), read straight off the request's
-            # token-slot row.
-            compressed_locs = (
-                self.token_slot_table[
-                    sequence_id, : complete_blocks * ratio : ratio
-                ].long()
-                // ratio
+        all_locs = self.prefill_loc_cache
+        if all_locs is None:
+            seq_list = self.sequence_lengths_list
+            if seq_list is None:
+                seq_list = sequence_lengths.tolist()
+            parts = []
+            for sequence_id in range(len(seq_list)):
+                complete_blocks = int(seq_list[sequence_id]) // ratio
+                if complete_blocks == 0:
+                    continue
+                # DSV4-style addressing: a group's compressed slot is its first
+                # raw slot // ratio (the page-aligned allocator keeps the group
+                # contiguous in one page), read straight off the request's
+                # token-slot row.
+                compressed_locs = (
+                    self.token_slot_table[
+                        sequence_id, : complete_blocks * ratio : ratio
+                    ].long()
+                    // ratio
+                )
+                parts.append(compressed_locs)
+            # One concatenated gather index reused by every layer of this
+            # forward; an empty index yields the same (0, H, D) shape the
+            # per-sequence path produced.
+            all_locs = (
+                torch.cat(parts, dim=0)
+                if parts
+                else compressed_buffer.new_empty((0,), dtype=torch.int64)
             )
-            parts.append(compressed_buffer.index_select(0, compressed_locs))
-        compressed_keys = (
-            torch.cat(parts, dim=0)
-            if parts
-            else compressed_buffer.new_empty(
-                (0, pool.qsa_index_kv_heads, pool.qsa_index_head_dim)
-            )
-        )
+            try:
+                object.__setattr__(self, "prefill_loc_cache", all_locs)
+            except (AttributeError, TypeError):
+                pass
+        compressed_keys = compressed_buffer.index_select(0, all_locs)
         num_valid_tokens = self.token_to_batch_idx.numel()
         if positions.numel() < num_valid_tokens:
             raise ValueError(
@@ -331,3 +348,21 @@ __all__ = [
     "build_rope_position_matrix",
     "compressed_decode_view",
 ]
+
+
+# ---- CPU-known max-position hint (2026-10-12) -----------------------------
+# The QSA indexer's rope path used to call positions.max().item() per layer -
+# a GPU->CPU sync per indexer call that drained the CPU-GPU pipeline every
+# layer (~80% of scheduler wall time on a 3x131k prefill, py-spy). The backend
+# sets this hint once per forward from seq_lens_cpu (it bounds every position
+# in that forward), and the indexer's ensure checks skip the sync.
+_MAX_POS_HINT: "int | None" = None
+
+
+def set_qsa_max_pos_hint(value) -> None:
+    global _MAX_POS_HINT
+    _MAX_POS_HINT = value
+
+
+def get_qsa_max_pos_hint():
+    return _MAX_POS_HINT
