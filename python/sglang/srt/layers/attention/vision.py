@@ -314,7 +314,11 @@ class VisionSdpaAttention(nn.Module):
         )
 
     @staticmethod
-    @lru_cache(maxsize=128)
+    # The mask is a host-side [1, s, s] bool tensor: s^2 bytes, i.e. 136 MiB at
+    # the 11664-patch binding of a 2048^2 image. Caching many distinct shapes
+    # therefore costs host RAM (<=1 GiB here), and rebuilding one costs ~0.1 s,
+    # so a small bound is the right trade.
+    @lru_cache(maxsize=8)
     def _generate_mask_cache(
         s: int, flatten_batch: bool, cu_seqlens: tuple
     ) -> torch.BoolTensor:
