@@ -349,6 +349,7 @@ from sglang.srt.utils import (
     triton_load_watch,
 )
 from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.headroom_guard import guard_device_headroom
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -375,6 +376,47 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _log_forward_failure_state(scheduler) -> None:
+    """Log the batch and device state around a fatal scheduler error.
+
+    A forward error cannot be recovered in-process: TP peers are already inside
+    the collectives of the same batch, so continuing on this rank would
+    desynchronize them. The SIGQUIT that follows is the correct action; this
+    log just makes the post-mortem (which request, how much memory, how
+    fragmented) available without archaeology.
+    """
+    if scheduler is None:
+        return
+    try:
+        batch = getattr(scheduler, "cur_batch_for_debug", None)
+        reqs = list(getattr(batch, "reqs", []) or [])
+        rids = [getattr(r, "rid", "?") for r in reqs[:6]]
+        mode = getattr(batch, "forward_mode", None)
+        extend_tokens = getattr(batch, "extend_num_tokens", None)
+        state = {
+            "mode": str(mode),
+            "extend_tokens": extend_tokens,
+            "batch_reqs": len(reqs),
+            "rids": rids,
+        }
+    except Exception:
+        state = {}
+    try:
+        free, total = torch.cuda.mem_get_info()
+        state.update(
+            {
+                "free_mib": free >> 20,
+                "total_mib": total >> 20,
+                "allocated_mib": torch.cuda.memory_allocated() >> 20,
+                "reserved_mib": torch.cuda.memory_reserved() >> 20,
+                "max_allocated_mib": torch.cuda.max_memory_allocated() >> 20,
+            }
+        )
+    except Exception:
+        pass
+    logger.error("Forward failure state: %s", state)
 
 
 def _prewarm_hccl_group(device, group, device_module):
@@ -4366,6 +4408,15 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    def _guard_device_headroom(self) -> None:
+        """Return cached device memory to the driver when headroom runs low.
+
+        See sglang.srt.utils.headroom_guard for the rationale: this is the only
+        OOM action that is local to one rank and therefore safe under tensor
+        parallelism.
+        """
+        guard_device_headroom(torch.cuda)
+
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(
         self,
@@ -4373,6 +4424,7 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        self._guard_device_headroom()
         self.metrics_reporter.record_scheduler_active()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
@@ -6162,6 +6214,7 @@ def run_scheduler_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
+        _log_forward_failure_state(scheduler)
         parent_process.send_signal(signal.SIGQUIT)
         # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
         # of NCCL/TCPStore tracebacks before they finally die.
