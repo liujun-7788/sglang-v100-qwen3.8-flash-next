@@ -1151,6 +1151,12 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+# Rope dedup registry: identical rope configs reuse one RotaryEmbedding (one
+# doubling cos_sin cache) instead of one per full-attention layer. See the
+# init comment in Qwen3_5AttentionDecoderLayer for the OOM motivation.
+_SHARED_ROTARY_INSTANCES: dict = {}
+
+
 class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
 
@@ -1200,16 +1206,37 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if self.attn_output_gate:
             logger.warning_once("using attn output gate!")
 
-        self.rotary_emb = get_rope(
-            head_size=self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=self.max_position_embeddings,
-            rope_scaling=rope_scaling,
-            base=self.rope_theta,
-            partial_rotary_factor=self.partial_rotary_factor,
-            is_neox_style=True,
-            dtype=torch.get_default_dtype(),
+        # 2026-10-19 VRAM fix (OMG-image OOM, log 2026-10-18): every
+        # full-attention layer built its own rotary Emb with its own cos_sin
+        # cache (doubling to max position seen, ~134 MB/instance at 262k).
+        # Thirteen instances ate ~1.7-3 GB of the 32 GB card, starving the
+        # vision pipeline (image decode fell back to CPU and the upload OOM'd
+        # with 4 MiB free at 20 MiB short). Identical rope configs share one
+        # instance: one cache, one growth; per-site dtype matches are then
+        # handled by _match_cos_sin_cache_dtype as before.
+        rope_key = (
+            self.head_dim,
+            self.max_position_embeddings,
+            self.rope_theta,
+            self.partial_rotary_factor,
+            repr(sorted(rope_scaling.items()))
+            if rope_scaling is not None
+            else None,
         )
+        shared = _SHARED_ROTARY_INSTANCES.get(rope_key)
+        if shared is None:
+            shared = get_rope(
+                head_size=self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=self.max_position_embeddings,
+                rope_scaling=rope_scaling,
+                base=self.rope_theta,
+                partial_rotary_factor=self.partial_rotary_factor,
+                is_neox_style=True,
+                dtype=torch.get_default_dtype(),
+            )
+            _SHARED_ROTARY_INSTANCES[rope_key] = shared
+        self.rotary_emb = shared
 
         # Q stays sharded across attention TP ranks; K/V are replicated within
         # each DCP group.
