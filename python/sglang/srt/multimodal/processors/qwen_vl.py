@@ -54,6 +54,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 )
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
+from sglang.srt.utils.mm_pre_resize import pre_resize_images
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
 
@@ -804,7 +805,9 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
 
         with self._temporary_fast_processor_cuda_pool(processor_device):
             result = processor.image_processor(
-                images=[entry.media for entry in entries],
+                # Same input-side cap as the non-artifact path; see
+                # sglang.srt.utils.mm_pre_resize.
+                images=pre_resize_images([entry.media for entry in entries]),
                 return_tensors="pt",
                 **image_kwargs,
             )

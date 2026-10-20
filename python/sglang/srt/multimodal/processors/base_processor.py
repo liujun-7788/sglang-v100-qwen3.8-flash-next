@@ -61,6 +61,7 @@ from sglang.srt.utils import (
     logger,
     smart_to_rgb,
 )
+from sglang.srt.utils.mm_pre_resize import pre_resize_images
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -212,7 +213,12 @@ def _tokenizer_of(processor):
 
 class BaseMultimodalProcessor(ABC):
     models = []
-    gpu_image_decode = True  # Enable GPU decoding by default
+    # nvJPEG decoding returns a CUDA tensor, which pins a CUDA context on rank
+    # 0's GPU inside the tokenizer process (~0.5-1 GiB) and makes input-size
+    # capping impossible without touching the GPU. SGLANG_MM_GPU_IMAGE_DECODE=0
+    # decodes on CPU instead: a few ms more per image, no device memory, and
+    # PIL inputs let mm_pre_resize bound the preprocessing cost.
+    gpu_image_decode = os.environ.get("SGLANG_MM_GPU_IMAGE_DECODE", "1") != "0"
     smart_rgb_conversion = False
     video_preprocessing_device = None
     prefer_tokenized_input = False
@@ -768,6 +774,14 @@ class BaseMultimodalProcessor(ABC):
         Resolved from this processor's own ``server_args``: engines sharing a
         tokenizer process each carry their own ``base_gpu_id``.
         """
+        # Explicit override. Running the torchvision processor on CPU keeps the
+        # tokenizer process off the GPUs entirely (it otherwise pins ~1 GiB on
+        # rank 0's card, leaving that rank with less OOM headroom than its TP
+        # peers), while staying far faster than the PIL backend, whose 10-D
+        # transpose+reshape costs ~90 s per 2048^2 image.
+        override = os.environ.get("SGLANG_MM_IMAGE_PROCESSOR_DEVICE")
+        if override:
+            return override
         server_args = self.server_args
         if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
             return "cpu"
@@ -848,6 +862,12 @@ class BaseMultimodalProcessor(ABC):
         processor, tokenizer = self._resolve_processor(processor)
 
         if images:
+            # Bound the input-side float32 conversion inside the HF image
+            # processor: it works on the full-resolution image, so a 4096^2
+            # upload costs ~31 s of memory bandwidth on this box even when
+            # max_pixels caps the output far below that. See
+            # sglang.srt.utils.mm_pre_resize.
+            images = pre_resize_images(images)
             kwargs["images"] = images
             if self.image_config:
                 kwargs.setdefault("images_kwargs", {}).update(self.image_config)
